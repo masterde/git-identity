@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# ssh-keygen wrapper used as gpg.ssh.program: signs through Secretive's agent even when the caller has no SSH_AUTH_SOCK.
+S="$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
+[ -S "$S" ] && export SSH_AUTH_SOCK="$S"
+exec ssh-keygen "$@"

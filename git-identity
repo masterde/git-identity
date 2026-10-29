@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# git identity — one signing key and one GitHub token per repository. macOS and Linux.
+# Guide: README.md in https://github.com/masterde/git-identity (also ~/Packages/git-identity/README.md)
+#
+#   git identity                      guided setup for this clone: key, GitHub registration, token, checks
+#   git identity --agent | --me       skip the first question: agent's clone (no Touch ID, own token entry) or your own
+#   git identity install [user@]host  copy this tool to another machine's ~/.local/bin over SSH
+#
+#   git identity set  [--sign <key-name>] [--token [--owner] [--replace]] [--email <email>] [--as <profile>]
+#   git identity show                 what this repo signs and authenticates with (never prints a token)
+#   git identity list                 stored tokens (account names only)
+#   git identity token                print this repo's token to a pipe, e.g. GH_TOKEN="$(git identity token)" gh pr list
+#   git identity forget [--owner]     remove this repo's (or its owner's) token
+#   git identity cred get             credential helper protocol; installed into the repo by setup / set --token
+#
+# Two modes, picked automatically (override with GIT_IDENTITY_MODE=secretive|file):
+#   secretive  a Mac with Secretive running: keys are Secure Enclave keys (Require Authentication for you, Notify for agents),
+#              matched by name in `ssh-add -L`; tokens live in the login Keychain (service git-identity,
+#              account github.com/<owner>/<repo>[@profile]).
+#   file       Linux, or a Mac without Secretive (headless, no Touch ID): keys are per-repo ed25519 files in
+#              ~/.ssh/identities/<name> (no passphrase, 0600; isolate agents by OS user); tokens live in
+#              ~/.config/git-identity/tokens/<account> (0600). Set GIT_IDENTITY_TOKEN to supply a token non-interactively.
+set -euo pipefail
+SERVICE=git-identity
+OS=${GIT_IDENTITY_OS:-$(uname -s)}
+SIGNERS=$(git config --global --get gpg.ssh.allowedSignersFile 2>/dev/null || echo "$HOME/.gitallowedsigners"); SIGNERS=${SIGNERS/#\~/$HOME}
+[ -n "$(git config --global --get gpg.ssh.allowedSignersFile 2>/dev/null)" ] || git config --global gpg.ssh.allowedSignersFile "$SIGNERS"
+KEYDIR="$HOME/.ssh/identities"
+TOKDIR="${XDG_CONFIG_HOME:-$HOME/.config}/git-identity/tokens"
+SECRETIVE_SOCK="$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
+MODE=${GIT_IDENTITY_MODE:-auto}
+if [ "$MODE" = auto ]; then if [ "$OS" = Darwin ] && [ -S "$SECRETIVE_SOCK" ]; then MODE=secretive; else MODE=file; fi; fi
+case "$MODE" in secretive|file) ;; *) echo "git identity: GIT_IDENTITY_MODE must be secretive or file" >&2; exit 1;; esac
+[ "$MODE" = secretive ] && export SSH_AUTH_SOCK="$SECRETIVE_SOCK"
+
+die() { echo "git identity: $*" >&2; exit 1; }
+need_repo() { git rev-parse --show-toplevel >/dev/null 2>&1 || die "not inside a git repository"; }
+slug() { # origin URL -> host/owner/repo
+  local u; u=$(git config --get remote.origin.url 2>/dev/null) || die "no origin remote"
+  case "$u" in git@*:*) u=${u#git@}; u=${u/:/\/};; ssh://git@*) u=${u#ssh://git@};; https://*) u=${u#https://};; *) die "unrecognised origin URL";; esac
+  u=${u%.git}; u=${u%/}; [[ "$u" == */*/* ]] || die "origin URL has no owner/repo: $u"; echo "$u"
+}
+owner_slug() { local s; s=$(slug); echo "${s%/*}"; }
+acct_name() { [ -n "${2:-}" ] && echo "$1@$2" || echo "$1"; }
+tok_file() { echo "$TOKDIR/${1//\//_}"; }
+
+# ---- token storage backend
+kc_get() { if [ "$MODE" = secretive ]; then security find-generic-password -s "$SERVICE" -a "$1" -w 2>/dev/null; else cat "$(tok_file "$1")" 2>/dev/null; fi; }
+kc_has() { if [ "$MODE" = secretive ]; then security find-generic-password -s "$SERVICE" -a "$1" >/dev/null 2>&1; else [ -s "$(tok_file "$1")" ]; fi; }
+kc_del() { if [ "$MODE" = secretive ]; then security delete-generic-password -s "$SERVICE" -a "$1" >/dev/null 2>&1; else rm -f "$(tok_file "$1")" 2>/dev/null && true; fi; }
+kc_put() { # $1 account; token on stdin
+  if [ "$MODE" = secretive ]; then
+    local tok; IFS= read -r tok; [ -n "$tok" ] || die "empty token"
+    printf 'add-generic-password -U -s "%s" -a "%s" -l "git-identity %s" -j "GitHub fine-grained token, %s" -w "%s"\n' "$SERVICE" "$1" "$1" "$(date +%Y-%m-%d)" "$tok" | security -i >/dev/null
+  else
+    mkdir -p "$TOKDIR"; chmod 700 "$TOKDIR"; umask 077; local f; f=$(tok_file "$1"); IFS= read -r tok; [ -n "$tok" ] || die "empty token"; printf '%s' "$tok" > "$f"; chmod 600 "$f"
+  fi
+}
+kc_list() { if [ "$MODE" = secretive ]; then security dump-keychain 2>/dev/null | awk -v s="$SERVICE" '/"acct"<blob>=/ {a=$0; sub(/.*"acct"<blob>="/,"",a); sub(/"$/,"",a)} /"svce"<blob>=/ {v=$0; sub(/.*"svce"<blob>="/,"",v); sub(/"$/,"",v); if (v==s) print a}' | sort; else ls "$TOKDIR" 2>/dev/null | sed 's#_#/#g' | sort; fi; }
+store_token() { # $1 account, $2 label
+  if [ -n "${GIT_IDENTITY_TOKEN:-}" ]; then printf '%s\n' "$GIT_IDENTITY_TOKEN" | kc_put "$1"; echo "  stored from GIT_IDENTITY_TOKEN."; return; fi
+  if [ -t 0 ]; then
+    local tok; read -rs -p "  Paste the fine-grained token for $2 (nothing is echoed): " tok; echo; printf '%s\n' "$tok" | kc_put "$1"; unset tok
+  elif [ "$MODE" = secretive ]; then
+    local tok; tok=$(osascript -e "display dialog \"Paste the GitHub fine-grained token for $2\" default answer \"\" with hidden answer with title \"git identity\" buttons {\"Cancel\",\"Store\"} default button \"Store\"" -e 'text returned of result' 2>/dev/null) || die "token entry cancelled"
+    printf '%s\n' "$tok" | kc_put "$1"; unset tok
+  else
+    die "no terminal to take the token. In a real shell on this machine run:  read -rs GIT_IDENTITY_TOKEN && export GIT_IDENTITY_TOKEN && git identity set --token${3:-}   (then unset GIT_IDENTITY_TOKEN)"
+  fi
+}
+
+# ---- key backend
+key_exists() { if [ "$MODE" = secretive ]; then ssh-add -L 2>/dev/null | awk -v n="$1" '$3 ~ ("^" n "@") {f=1} END {exit !f}'; else [ -f "$KEYDIR/$1" ] && [ -f "$KEYDIR/$1.pub" ]; fi; }
+key_pub() { if [ "$MODE" = secretive ]; then ssh-add -L 2>/dev/null | awk -v n="$1" '$3 ~ ("^" n "@") {print $1" "$2; exit}'; else awk '{print $1" "$2}' "$KEYDIR/$1.pub"; fi; }
+key_names() { if [ "$MODE" = secretive ]; then ssh-add -L 2>/dev/null | awk '{sub(/@.*/,"",$3); print $3}'; else ls "$KEYDIR" 2>/dev/null | grep -v '\.pub$'; fi; }
+key_create_file() { mkdir -p "$KEYDIR"; chmod 700 "$KEYDIR"; ssh-keygen -q -t ed25519 -N '' -C "$1@$(hostname -s)" -f "$KEYDIR/$1"; chmod 600 "$KEYDIR/$1"; }
+bind_key() { # $1 name, $2 email, $3 profile
+  local pub; pub=$(key_pub "$1"); [ -n "$pub" ] || die "key '$1' has no public key"
+  [ -n "$3" ] && git config --local identity.profile "$3"
+  git config --local user.email "$2"
+  git config --local gpg.format ssh
+  if [ "$MODE" = secretive ]; then git config --local gpg.ssh.program "$HOME/.local/bin/git-identity-keygen"; git config --local user.signingkey "key::$pub"
+  else git config --local --unset gpg.ssh.program 2>/dev/null || true; git config --local user.signingkey "$KEYDIR/$1"; fi
+  git config --local commit.gpgsign true
+  git config --local tag.gpgsign true
+  touch "$SIGNERS"; grep -qF "$pub" "$SIGNERS" || printf '%s namespaces="git" %s %s\n' "$2" "$pub" "$1" >> "$SIGNERS"
+  echo "$pub"
+}
+bind_token_helper() {
+  git config --local --replace-all credential.helper ""
+  git config --local --add credential.helper "!git-identity cred"
+  git config --local credential.useHttpPath true
+}
+open_url() { if [ "$MODE" = secretive ]; then open "$1"; else echo "      $1"; fi; }
+clip() { if [ "$MODE" = secretive ]; then pbcopy; echo "  (copied to the clipboard)"; else cat; echo; fi; }
+
+cmd_setup() {
+  need_repo
+  local agent=-1 email=""
+  while [ $# -gt 0 ]; do case "$1" in --agent) agent=1; shift;; --me) agent=0; shift;; --email) email=${2:?}; shift 2;; *) die "unknown option $1";; esac; done
+  if [ $agent = -1 ] && [ ! -t 0 ]; then agent=1; echo "(no terminal input: assuming the agent commits here; use --me for yourself)"; fi
+  if [ $agent = -1 ]; then
+    echo "Who commits in this clone?"; echo "  [1] the agent responsible for this repo   <- default"; echo "  [2] me (Touch ID on every commit)"
+    local ans; read -r -p "  choice [1]: " ans; case "${ans:-1}" in 2) agent=0;; *) agent=1;; esac; echo
+  fi
+  local s; s=$(slug); local o; o=$(owner_slug); local repo=${s##*/}; local owner=${o##*/}
+  local name="$owner-$repo"; [ $agent = 1 ] && name="agent-$owner-$repo"
+  local profile=""; [ $agent = 1 ] && profile=agent
+  [ -n "$email" ] || email=$(git config --get user.email || true)
+  [ -n "$email" ] || die "no email known for this repo; pass --email (an email verified on the GitHub account that holds the key, or commits show Unverified)"
+  echo "Setting up $s${profile:+ as $profile} on $(hostname -s) ($OS, $MODE mode)"; echo
+
+  echo "Step 1 of 3: signing key '$name'"
+  if key_exists "$name"; then echo "  already exists, reusing it."
+  elif [ "$MODE" = secretive ]; then
+    open -a Secretive
+    echo "  Secretive is open. Click +, and create a key with:"
+    echo "      Name:        $name"
+    if [ $agent = 1 ]; then echo "      Protection:  Notify                  (no Touch ID; a notification per use)"; else echo "      Protection:  Require Authentication  (Touch ID per commit)"; fi
+    echo "  Waiting for it to appear in the agent (Ctrl-C to abort) ..."
+    local i=0; until key_exists "$name"; do sleep 2; i=$((i+1)); [ $i -lt 450 ] || die "gave up after 15 minutes; run 'git identity' again once the key exists"; done; echo "  found."
+  else
+    key_create_file "$name"; echo "  generated $KEYDIR/$name (ed25519, no passphrase, 0600, owner $(id -un))."
+  fi
+  local pub; pub=$(bind_key "$name" "$email" "$profile")
+  echo "  bound to this clone as $email."
+  echo "  Register it on GitHub as a Signing Key (Settings -> SSH and GPG keys -> New SSH key, type Signing Key, title $name):"
+  open_url "https://github.com/settings/ssh/new"
+  printf '%s %s\n' "$pub" "$name" | clip
+  if [ -t 0 ]; then read -r -p "  Press Enter when the key is added (or to skip for now) " _; else echo "  (add it now; the setup continues without waiting)"; fi; echo
+
+  echo "Step 2 of 3: fine-grained token for $s"
+  local acct; acct=$(acct_name "$s" "$profile")
+  if kc_has "$acct"; then echo "  one is already stored for $acct, reusing it ('git identity set --token --replace' to change)."
+  else
+    echo "  Create it here:"; open_url "https://github.com/settings/personal-access-tokens/new"
+    echo "      Token name:        $name"; echo "      Expiration:        30 to 90 days"; echo "      Resource owner:    $owner"
+    echo "      Repository access: Only select repositories -> $repo"; echo "      Permissions:       Contents: Read and write"
+    [ $agent = 1 ] && echo "                         Pull requests: Read and write   (if the agent opens PRs)"
+    store_token "$acct" "$s" "${profile:+ --as $profile}"
+    echo "  stored for $acct."
+  fi
+  bind_token_helper; echo
+
+  echo "Step 3 of 3: check"
+  if git fetch -q origin 2>/dev/null; then echo "  fetch with the token: OK"; else echo "  fetch with the token: FAILED (token not for this repo, or storage not readable; run 'git fetch' to see the error)"; fi
+  local had_head=1; git rev-parse -q --verify HEAD >/dev/null 2>&1 || had_head=0
+  if git -c commit.gpgsign=true commit -q --allow-empty -m "git identity check" 2>/dev/null; then
+    local st; st=$(git log -1 --format=%G?); if [ $had_head = 1 ]; then git reset -q --hard HEAD~1; else git update-ref -d HEAD; fi
+    [ "$st" = G ] && echo "  signed commit: OK (good signature)" || echo "  signed commit: made, but not verifiable locally (status $st); check $SIGNERS"
+  else echo "  signed commit: FAILED (authentication declined, or key unavailable)"; fi
+  echo; cmd_show
+}
+
+cmd_set() {
+  need_repo
+  local sign="" token=0 email="" scope_owner=0 replace=0 profile=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --sign) sign=${2:?}; shift 2;; --token) token=1; shift;; --email) email=${2:?}; shift 2;;
+    --owner) scope_owner=1; shift;; --replace) replace=1; shift;; --as) profile=${2:?}; shift 2;; *) die "unknown option $1";; esac; done
+  [ -n "$sign" ] || [ $token = 1 ] || [ -n "$email" ] || [ -n "$profile" ] || die "nothing to set: use --sign <key>, --token, --email <email> and/or --as <profile>"
+  local s; s=$(slug)
+  if [ -n "$profile" ]; then git config --local identity.profile "$profile"; echo "profile: $profile"; fi
+  profile=$(git config --local --get identity.profile || true)
+  if [ -n "$email" ]; then git config --local user.email "$email"; echo "email: $email"; fi
+  if [ -n "$sign" ]; then
+    key_exists "$sign" || die "no key named '$sign'. $([ "$MODE" = secretive ] && echo "Create it in Secretive with that exact name" || echo "Run 'git identity' to generate one"). Keys present: $(key_names | tr '\n' ' ')"
+    local principal; principal=$(git config --get user.email) || die "set an email first (--email)"
+    bind_key "$sign" "$principal" "$profile" >/dev/null; echo "signing: $sign for $s"
+  fi
+  if [ $token = 1 ]; then
+    local acct="$s"; [ $scope_owner = 1 ] && acct=$(owner_slug); acct=$(acct_name "$acct" "$profile")
+    if kc_has "$acct" && [ $replace = 0 ]; then echo "token: one is already stored for $acct; reusing it (--replace to enter a new one)"
+    else store_token "$acct" "$acct" "${profile:+ --as $profile}"; echo "token: stored for $acct"; fi
+    bind_token_helper; echo "this repo now authenticates with the token for $acct"
+  fi
+}
+
+cmd_show() {
+  need_repo
+  local s; s=$(slug); local o; o=$(owner_slug)
+  echo "repo:        $s"; echo "email:       $(git config --get user.email || echo '-')"
+  local k; k=$(git config --get user.signingkey || true)
+  if [[ "$k" == key::* ]]; then local name; name=$(ssh-add -L 2>/dev/null | awk -v p="${k#key::}" '$1" "$2==p {sub(/@.*/,"",$3); print $3; exit}'); echo "signing key: ${name:-<not in agent>} (Secretive, inline)"
+  elif [[ "$k" == "$KEYDIR"/* ]]; then echo "signing key: ${k##*/} (file, $KEYDIR)"
+  else echo "signing key: ${k:-<none>}${k:+ (global or inherited, not repo-specific)}"; fi
+  echo "gpgsign:     commit=$(git config --get commit.gpgsign || echo false) tag=$(git config --get tag.gpgsign || echo false)"
+  local pr; pr=$(git config --local --get identity.profile || true); [ -n "$pr" ] && echo "profile:     $pr"
+  local sa oa; sa=$(acct_name "$s" "$pr"); oa=$(acct_name "$o" "$pr")
+  if kc_has "$sa"; then echo "token:       repo-scoped entry present ($sa)"; elif kc_has "$oa"; then echo "token:       owner-scoped entry present ($oa)"; else echo "token:       none stored for $sa or $oa"; fi
+  echo "cred helper: $(git config --local --get-all credential.helper 2>/dev/null | grep . | tr '\n' ' ' || echo '<inherited>')"
+}
+
+cmd_token() { need_repo; [ -t 1 ] && die "refusing to print a token to a terminal; use it in a pipe or a substitution"
+  local s; s=$(slug); local o; o=$(owner_slug); local pr; pr=$(git config --local --get identity.profile || true)
+  kc_get "$(acct_name "$s" "$pr")" || kc_get "$(acct_name "$o" "$pr")" || die "no token for $s or $o${pr:+ (profile $pr)}"; }
+cmd_forget() { need_repo; local acct; acct=$(slug); [ "${1:-}" = "--owner" ] && acct=$(owner_slug); acct=$(acct_name "$acct" "$(git config --local --get identity.profile || true)")
+  kc_has "$acct" || die "no token for $acct"; kc_del "$acct"; echo "removed token for $acct"; }
+cmd_cred() { [ "${1:-}" = get ] || exit 0
+  local host="" path="" k v; while IFS='=' read -r k v; do case "$k" in host) host=$v;; path) path=$v;; esac; done
+  [ "$host" = github.com ] || exit 0; path=${path%.git}; path=${path%/}
+  local pr; pr=$(git config --local --get identity.profile 2>/dev/null || true); local tok=""
+  if [ -n "$path" ]; then tok=$(kc_get "$(acct_name "$host/$path" "$pr")" || true); [ -n "$tok" ] || tok=$(kc_get "$(acct_name "$host/${path%%/*}" "$pr")" || true); fi
+  [ -n "$tok" ] || exit 0; printf 'username=x-access-token\npassword=%s\n' "$tok"; }
+cmd_install() { local host=${1:?usage: git identity install [user@]host}
+  # copies this script, and on a Mac target also the signing wrapper; a Mac target must have Secretive installed
+  local wrapper="$(dirname "$0")/git-identity-keygen"
+  ssh "$host" 'mkdir -p ~/.local/bin' && scp -q "$0" "$host:~/.local/bin/git-identity" || die "copy failed"
+  [ -f "$wrapper" ] && scp -q "$wrapper" "$host:~/.local/bin/git-identity-keygen"
+  ssh "$host" 'chmod +x ~/.local/bin/git-identity ~/.local/bin/git-identity-keygen 2>/dev/null
+    case ":$PATH:" in *":$HOME/.local/bin:"*) echo "installed; ~/.local/bin is on PATH";; *) echo "installed; add ~/.local/bin to PATH on this host (e.g. in ~/.profile or ~/.zprofile)";; esac
+    command -v git >/dev/null || echo "WARNING: git not found on this host"
+    if [ "$(uname -s)" = Darwin ]; then
+      if [ -d /Applications/Secretive.app ]; then echo "Secretive found; keys will be created there (one Secure Enclave key per Mac, register each on GitHub)"
+      else echo "Secretive not installed on this Mac: git identity will use file mode (ed25519 key files + 0600 token files, like Linux)"; fi
+      [ -d /Applications/Secretive.app ] && [ ! -S "$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh" ] && echo "note: Secretive agent socket not present; open Secretive once, or git identity falls back to file mode"
+    fi'; }
+
+case "${1:-}" in
+  ""|setup|--agent|--me|--email) [ "${1:-}" = setup ] && shift; cmd_setup "$@";;
+  set) shift; cmd_set "$@";; show) cmd_show;; list) kc_list;; token) cmd_token;; forget) shift; cmd_forget "$@";; cred) shift; cmd_cred "$@";;
+  install) shift; cmd_install "$@";;
+  -h|--help|help) sed -n '2,20p' "$0";;
+  *) die "unknown command '$1' (setup, set, show, list, token, forget, cred, install)";;
+esac
