@@ -8,17 +8,22 @@ Quick reference: `git identity help`.
 
 ## Install
 
-On this machine:
+One line, on any Mac or Linux machine with curl (wget works too):
 
 ```bash
-git clone https://github.com/masterde/git-identity.git && git-identity/install.sh
+curl -fsSL https://raw.githubusercontent.com/masterde/git-identity/main/install.sh | bash
 ```
 
-On another machine, from a machine that already has it (copies the tool over SSH):
+It puts `git-identity` and `git-identity-keygen` into `~/.local/bin` and tells you if that
+directory is not on your PATH. From a clone of this repo, `./install.sh` does the same from the
+checked-out files. A machine that already has the tool can push it to another one over SSH:
 
 ```bash
 git identity install user@host
 ```
+
+Mac only: install [Secretive](https://github.com/maxgoedjen/secretive) for Secure Enclave keys
+(`brew install --cask secretive`). Without it the tool uses key files, as on Linux.
 
 ---
 
